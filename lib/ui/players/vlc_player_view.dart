@@ -1,13 +1,21 @@
 // lib/ui/players/vlc_player_view.dart
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_vlc_player/flutter_vlc_player.dart';
+import 'vlc_controls.dart';
 
 class VLCPlayerView extends StatefulWidget {
   final String videoPath;
-  const VLCPlayerView({super.key, required this.videoPath});
+  final ValueChanged<bool>? onFullscreenChanged;
+
+  const VLCPlayerView({
+    super.key,
+    required this.videoPath,
+    this.onFullscreenChanged,
+  });
 
   @override
   State<VLCPlayerView> createState() => _VLCPlayerViewState();
@@ -15,34 +23,126 @@ class VLCPlayerView extends StatefulWidget {
 
 class _VLCPlayerViewState extends State<VLCPlayerView> {
   VlcPlayerController? _vlcController;
-  Timer? _positionTimer;
-  Timer? _hideTimer;
 
+  Timer? _hideTimer;
   bool _loading = true;
   bool _showControls = true;
-  bool _isPlaying = false;
-  bool _isSeeking = false;
-  bool _isFullscreen = false;
 
+  // UI state driven by controller.value via listener:
   double _currentPosition = 0.0; // ms
   double _duration = 1.0; // ms
+  bool _isPlaying = false;
+  bool _isEnded = false;
 
-  // Use video aspect if available; default to 16/9
+  // temporary ignore window after issuing play to avoid racing UI updates (ms)
+  DateTime? _ignorePlayingUntil;
+  // increased slightly to give controller time to stabilize
+  static const int _ignoreAfterPlayMs = 1200;
+
+  bool _isFullscreen = false;
   double _videoAspect = 16.0 / 9.0;
   double _playbackSpeed = 1.0;
 
   Map<int, String> _audioTracks = {};
   Map<int, String> _subtitleTracks = {};
   int? _selectedAudioId;
-  int? _selectedSubtitleId; // -1 => none
+  int? _selectedSubtitleId;
+
+  String? _initError; // human readable init error message
 
   static const int _skipMs = 10000;
   final List<double> _speedOptions = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
+  // ended threshold for manual checks (ms)
+  static const int _endedThresholdMs = 800;
+
+  // Attach / detach listener
+  void _attachControllerListener() {
+    try {
+      _vlcController?.addListener(_controllerListener);
+    } catch (e) {
+      debugPrint('attachListener failed: $e');
+    }
+  }
+
+  void _detachControllerListener() {
+    try {
+      _vlcController?.removeListener(_controllerListener);
+    } catch (_) {}
+  }
+
+  void _controllerListener() {
+    final c = _vlcController;
+    if (c == null) return;
+    final v = c.value;
+
+    // debug: log authoritative state
+    debugPrint(
+        'controllerListener: playing=${v.isPlaying} pos=${v.position.inMilliseconds} dur=${v.duration.inMilliseconds} ended=${v.isEnded} aspect=${v.aspectRatio} ignoreUntil=$_ignorePlayingUntil');
+
+    // controller value fields
+    final pos = v.position;
+    final dur = v.duration;
+    final playing = v.isPlaying;
+    final endedFlag = v.isEnded;
+
+    final posMs = pos.inMilliseconds.toDouble();
+    final durMs = (dur.inMilliseconds > 0) ? dur.inMilliseconds.toDouble() : _duration;
+
+    final now = DateTime.now();
+    final ignoreActive = _ignorePlayingUntil != null && now.isBefore(_ignorePlayingUntil!);
+
+    // Use aspect ratio reported by controller if available
+    final asp = v.aspectRatio;
+    if (asp > 0 && asp.isFinite && asp != _videoAspect) {
+      _videoAspect = asp;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      // update duration/position
+      _currentPosition = posMs;
+      if (durMs > 0) _duration = durMs;
+
+      // update playing but respect ignore window (don't overwrite immediately after our play())
+      if (!ignoreActive) {
+        _isPlaying = playing;
+      }
+
+      // IMPORTANT: during the ignore window we *don't* accept controller's isEnded=true
+      final effectiveEnded = ignoreActive ? false : endedFlag;
+
+      // ended detection: prefer controller's isEnded when not ignored; otherwise fallback to near-end & not playing
+      if (effectiveEnded) {
+        _isEnded = true;
+      } else if (_duration > 0) {
+        final nearEnd = _currentPosition >= (_duration - _endedThresholdMs);
+        _isEnded = ((!_isPlaying) && nearEnd);
+      } else {
+        _isEnded = false;
+      }
+
+      // clear ignore window if expired
+      if (_ignorePlayingUntil != null && !now.isBefore(_ignorePlayingUntil!)) {
+        _ignorePlayingUntil = null;
+      }
+    });
+  }
+
   @override
   void initState() {
     super.initState();
-    _initController();
+    _initController(); // create controller initially
+  }
+
+  @override
+  void didUpdateWidget(covariant VLCPlayerView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // if path changed, recreate controller
+    if (oldWidget.videoPath != widget.videoPath) {
+      debugPrint('videoPath changed -> reinit controller');
+      _recreateController();
+    }
   }
 
   String _normalize(String p) {
@@ -50,97 +150,121 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
     return p.startsWith('/') ? p : '/$p';
   }
 
+  Future<bool> _fileExists(String path) async {
+    try {
+      final f = File(path);
+      return await f.exists();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _recreateController() async {
+    await _disposeControllerSafe();
+    setState(() {
+      _loading = true;
+      _initError = null;
+      _currentPosition = 0.0;
+      _duration = 1.0;
+      _isPlaying = false;
+      _isEnded = false;
+    });
+    await _initController();
+  }
+
+  Future<void> _disposeControllerSafe() async {
+    _detachControllerListener();
+    try {
+      await _vlcController?.stop();
+    } catch (_) {}
+    try {
+      await _vlcController?.dispose();
+    } catch (_) {}
+    _vlcController = null;
+  }
+
+  /// Try to create controller if missing. Returns true if controller exists after this call.
+  Future<bool> _ensureController() async {
+    if (_vlcController != null) return true;
+
+    debugPrint('ensureController: controller null — attempting init');
+    try {
+      await _initController();
+      // short wait to allow value to populate
+      await Future.delayed(const Duration(milliseconds: 120));
+      return _vlcController != null;
+    } catch (e) {
+      debugPrint('ensureController failed: $e');
+      return false;
+    }
+  }
+
   Future<void> _initController() async {
     final raw = widget.videoPath;
     final path = _normalize(raw);
     debugPrint('VLC init: raw="$raw" normalized="$path"');
 
+    // defensive checks & choose method
     try {
-      if (path.startsWith('content://')) {
-        _vlcController = VlcPlayerController.network(path, hwAcc: HwAcc.full, autoPlay: true, options: VlcPlayerOptions());
+      // If it's a content or http(s) uri — use network
+      if (path.startsWith('content://') || path.startsWith('http://') || path.startsWith('https://')) {
+        _vlcController = VlcPlayerController.network(
+          path,
+          hwAcc: HwAcc.full,
+          autoPlay: true,
+          options: VlcPlayerOptions(),
+        );
       } else {
-        final file = File(path);
-        final exists = await file.exists().catchError((_) => false);
-        debugPrint('VLC init: fileExists=$exists for "$path"');
+        // treat as file path; verify exists
+        final exists = await _fileExists(path);
+        debugPrint('file exists? $exists path=$path');
         if (exists) {
-          _vlcController = VlcPlayerController.file(file, hwAcc: HwAcc.full, autoPlay: true, options: VlcPlayerOptions());
+          _vlcController = VlcPlayerController.file(
+            File(path),
+            hwAcc: HwAcc.full,
+            autoPlay: true,
+            options: VlcPlayerOptions(),
+          );
         } else {
-          // fallback: try network
-          _vlcController = VlcPlayerController.network(path, hwAcc: HwAcc.full, autoPlay: true, options: VlcPlayerOptions());
+          // fallback attempt: try network creation (some paths might be accessible via file URI)
+          debugPrint('file not found — attempting network fallback for path: $path');
+          _vlcController = VlcPlayerController.network(
+            path,
+            hwAcc: HwAcc.full,
+            autoPlay: true,
+            options: VlcPlayerOptions(),
+          );
         }
       }
 
-      // give controller a short time to init
-      await Future.delayed(const Duration(milliseconds: 400));
+      // Attach listener and start
+      _attachControllerListener();
 
-      // try to read aspect ratio from VLC (if available)
-      await _tryReadAspectRatio();
-
-      // start position polling (guarded)
-      _positionTimer = Timer.periodic(const Duration(milliseconds: 400), (_) => _updatePosition());
-
-      // refresh tracks a little later
+      // small delays to populate controller.value
+      await Future.delayed(const Duration(milliseconds: 300));
       Future.delayed(const Duration(milliseconds: 700), _refreshTrackLists);
 
-      // auto-hide
-      _startHideTimer();
-
-      setState(() => _loading = false);
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _initError = null;
+      });
     } catch (e, st) {
       debugPrint('VLC init error: $e\n$st');
-      setState(() => _loading = false);
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _initError = 'Failed to open video (${e.toString()})';
+      });
     }
-  }
-
-  Future<void> _tryReadAspectRatio() async {
-    final c = _vlcController;
-    if (c == null) return;
-    try {
-      final aspStr = await c.getVideoAspectRatio(); // e.g. "16:9"
-      debugPrint('VLC aspect string: $aspStr');
-      if (aspStr != null && aspStr.isNotEmpty) {
-        final parsed = _parseAspectString(aspStr);
-        if (parsed != null) {
-          if (mounted) setState(() => _videoAspect = parsed);
-          return;
-        }
-      }
-
-      // fallback: if we can't read aspect, give portrait videos a taller default so they don't appear tiny
-      final mq = MediaQuery.maybeOf(context);
-      if (mq != null) {
-        final deviceAsp = mq.size.aspectRatio;
-        if (deviceAsp < 0.8) {
-          if (mounted) setState(() => _videoAspect = 2.0 / 3.0); // more vertical default
-        } else {
-          if (mounted) setState(() => _videoAspect = 16.0 / 9.0);
-        }
-      }
-    } catch (e) {
-      debugPrint('tryReadAspectRatio failed: $e');
-    }
-  }
-
-  double? _parseAspectString(String s) {
-    try {
-      final cleaned = s.replaceAll(' ', '').replaceAll('x', ':').replaceAll('/', ':');
-      final reg = RegExp(r'(\d+\.?\d*):(\d+\.?\d*)');
-      final m = reg.firstMatch(cleaned);
-      if (m != null) {
-        final a = double.tryParse(m.group(1)!);
-        final b = double.tryParse(m.group(2)!);
-        if (a != null && b != null && b > 0) return a / b;
-      }
-    } catch (_) {}
-    return null;
   }
 
   Future<void> _refreshTrackLists() async {
     final c = _vlcController;
     if (c == null) return;
     try {
-      final audio = await c.getAudioTracks(); // Map<int, String>
-      final subs = await c.getSpuTracks(); // Map<int, String>
+      final audio = await c.getAudioTracks();
+      final subs = await c.getSpuTracks();
       if (!mounted) return;
       setState(() {
         _audioTracks = audio ?? {};
@@ -153,33 +277,6 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
     }
   }
 
-  Future<void> _updatePosition() async {
-    final c = _vlcController;
-    if (c == null || !mounted) return;
-    try {
-      final playingNullable = await c.isPlaying();
-      if (playingNullable == null) return;
-      final playing = playingNullable;
-      final pos = await c.getPosition();
-      final dur = await c.getDuration();
-
-      final posMs = pos?.inMilliseconds.toDouble() ?? _currentPosition;
-      final durMs = dur?.inMilliseconds.toDouble() ?? _duration;
-
-      if (!_isSeeking) {
-        setState(() {
-          _isPlaying = playing;
-          _currentPosition = posMs;
-          if (durMs > 0) _duration = durMs;
-        });
-      } else {
-        setState(() => _isPlaying = playing);
-      }
-    } catch (e) {
-      debugPrint('updatePosition error: $e');
-    }
-  }
-
   void _startHideTimer() {
     _hideTimer?.cancel();
     _hideTimer = Timer(const Duration(seconds: 3), () {
@@ -187,33 +284,29 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
     });
   }
 
-  Future<void> _togglePlayPause() async {
-    final c = _vlcController;
-    if (c == null) return;
-    try {
-      final playingNullable = await c.isPlaying();
-      final playing = playingNullable ?? false;
-      if (playing) {
-        await c.pause();
-      } else {
-        await c.play();
-      }
-      if (mounted) setState(() => _isPlaying = !playing);
-    } catch (e) {
-      debugPrint('togglePlayPause error: $e');
-    }
-    _startHideTimer();
-  }
-
   Future<void> _seekTo(double millis) async {
     final c = _vlcController;
     if (c == null) return;
     final ms = millis.clamp(0.0, _duration).toInt();
     try {
-      await c.setTime(ms);
-      if (mounted) _currentPosition = ms.toDouble();
+      // prefer seekTo API when available (it accepts Duration)
+      await c.seekTo(Duration(milliseconds: ms));
+      if (mounted) {
+        _currentPosition = ms.toDouble();
+        if (_currentPosition < (_duration - _endedThresholdMs)) _isEnded = false;
+      }
     } catch (e) {
       debugPrint('seekTo error: $e');
+      // fallback to setTime if needed
+      try {
+        await c.setTime(ms);
+        if (mounted) {
+          _currentPosition = ms.toDouble();
+          if (_currentPosition < (_duration - _endedThresholdMs)) _isEnded = false;
+        }
+      } catch (e2) {
+        debugPrint('setTime fallback error: $e2');
+      }
     }
   }
 
@@ -259,8 +352,141 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
     }
   }
 
+  /// Forceful restart sequence with multiple fallback attempts.
+  Future<bool> _forceRestartPlayback() async {
+    final c = _vlcController;
+    if (c == null) return false;
+
+    debugPrint('forceRestartPlayback: start sequence');
+
+    // 1) seekTo(0) + play()
+    try {
+      _ignorePlayingUntil = DateTime.now().add(Duration(milliseconds: _ignoreAfterPlayMs));
+      try {
+        await c.seekTo(Duration.zero);
+      } catch (_) {
+        try {
+          await c.setTime(0);
+        } catch (_) {}
+      }
+      await c.play();
+      await Future.delayed(const Duration(milliseconds: 400));
+      if (c.value.isPlaying) {
+        debugPrint('forceRestartPlayback: success with seek+play');
+        return true;
+      }
+      debugPrint('forceRestartPlayback: seek+play did not start');
+    } catch (e) {
+      debugPrint('forceRestartPlayback: seek+play error: $e');
+    }
+
+    // 2) stop + play
+    try {
+      _ignorePlayingUntil = DateTime.now().add(Duration(milliseconds: _ignoreAfterPlayMs));
+      await c.stop();
+      await Future.delayed(const Duration(milliseconds: 150));
+      await c.play();
+      await Future.delayed(const Duration(milliseconds: 400));
+      if (c.value.isPlaying) {
+        debugPrint('forceRestartPlayback: success with stop+play');
+        return true;
+      }
+      debugPrint('forceRestartPlayback: stop+play did not start');
+    } catch (e) {
+      debugPrint('forceRestartPlayback: stop+play error: $e');
+    }
+
+    // 3) recreate controller and play
+    try {
+      debugPrint('forceRestartPlayback: recreating controller as fallback');
+      final oldPath = widget.videoPath;
+      await _disposeControllerSafe();
+      await Future.delayed(const Duration(milliseconds: 120));
+      await _initController(); // this attaches listener again
+      await Future.delayed(const Duration(milliseconds: 300));
+      if (_vlcController != null) {
+        final c2 = _vlcController!;
+        _ignorePlayingUntil = DateTime.now().add(Duration(milliseconds: _ignoreAfterPlayMs));
+        try {
+          await c2.seekTo(Duration.zero);
+        } catch (_) {
+          try {
+            await c2.setTime(0);
+          } catch (_) {}
+        }
+        await c2.play();
+        await Future.delayed(const Duration(milliseconds: 400));
+        if (c2.value.isPlaying) {
+          debugPrint('forceRestartPlayback: success after recreate');
+          return true;
+        }
+        debugPrint('forceRestartPlayback: recreate+play did not start');
+      } else {
+        debugPrint('forceRestartPlayback: recreate resulted in null controller');
+      }
+    } catch (e) {
+      debugPrint('forceRestartPlayback: recreate error: $e');
+    }
+
+    debugPrint('forceRestartPlayback: all fallbacks failed');
+    return false;
+  }
+
+  /// Play/pause button handler. If video ended, restart from 0.
+  Future<void> _onPlayPausePressed() async {
+    // Ensure controller exists (try to recreate if null)
+    final ok = await _ensureController();
+    if (!ok) {
+      setState(() {
+        _initError = 'Unable to open video. Tap Retry.';
+      });
+      return;
+    }
+
+    final c = _vlcController!;
+    try {
+      final v = c.value;
+      final playing = v.isPlaying;
+      final durMs = v.duration.inMilliseconds.toDouble();
+      final posMs = v.position.inMilliseconds.toDouble();
+
+      final nearEnd = (durMs > 0) && (posMs >= (durMs - _endedThresholdMs));
+
+      if ((v.isEnded || nearEnd) && !playing) {
+        // Try forceful restart sequence
+        final success = await _forceRestartPlayback();
+        if (!success) {
+          setState(() => _initError = 'Unable to restart playback (see logs).');
+        } else {
+          if (mounted) setState(() {
+            _currentPosition = 0.0;
+            _isPlaying = true;
+            _isEnded = false;
+            _initError = null;
+          });
+        }
+      } else {
+        if (playing) {
+          await c.pause();
+          if (mounted) setState(() => _isPlaying = false);
+        } else {
+          _ignorePlayingUntil = DateTime.now().add(Duration(milliseconds: _ignoreAfterPlayMs));
+          await c.play();
+          if (mounted) setState(() => _isPlaying = true);
+        }
+      }
+    } catch (e) {
+      debugPrint('onPlayPausePressed error: $e');
+      setState(() => _initError = 'Playback error: ${e.toString()}');
+    }
+
+    _startHideTimer();
+  }
+
   Future<void> _toggleFullscreen() async {
     setState(() => _isFullscreen = !_isFullscreen);
+    widget.onFullscreenChanged?.call(_isFullscreen);
+
     if (_isFullscreen) {
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
       await SystemChrome.setPreferredOrientations([DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]);
@@ -269,71 +495,6 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
       await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp, DeviceOrientation.portraitDown]);
     }
     _startHideTimer();
-  }
-
-  String _formatMs(double ms) {
-    final totalSeconds = (ms / 1000).floor();
-    final hours = totalSeconds ~/ 3600;
-    final minutes = (totalSeconds % 3600) ~/ 60;
-    final seconds = totalSeconds % 60;
-    if (hours > 0) {
-      return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
-    } else {
-      return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
-    }
-  }
-
-  Widget _buildControlBar({required bool fullscreen}) {
-    final padding = fullscreen ? 16.0 : 8.0;
-    final bottom = MediaQuery.of(context).viewPadding.bottom;
-    return SafeArea(
-      bottom: true,
-      child: Container(
-        color: Colors.black54,
-        padding: EdgeInsets.fromLTRB(padding, 8, padding, 8 + bottom),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Row(children: [
-            Text(_formatMs(_currentPosition), style: const TextStyle(color: Colors.white)),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Slider(
-                min: 0,
-                max: _duration > 0 ? _duration : 1.0,
-                value: _currentPosition.clamp(0, _duration),
-                onChangeStart: (_) {
-                  _isSeeking = true;
-                  _hideTimer?.cancel();
-                },
-                onChanged: (v) => setState(() => _currentPosition = v),
-                onChangeEnd: (v) async {
-                  await _seekTo(v);
-                  _isSeeking = false;
-                  _startHideTimer();
-                },
-              ),
-            ),
-            const SizedBox(width: 8),
-            Text(_formatMs(_duration), style: const TextStyle(color: Colors.white)),
-          ]),
-          const SizedBox(height: 6),
-          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-            IconButton(icon: const Icon(Icons.replay_10, color: Colors.white), onPressed: _skipBackward),
-            const SizedBox(width: 12),
-            IconButton(
-              iconSize: 44,
-              icon: Icon(_isPlaying ? Icons.pause_circle_filled : Icons.play_circle_filled, color: Colors.white),
-              onPressed: _togglePlayPause,
-            ),
-            const SizedBox(width: 12),
-            IconButton(icon: const Icon(Icons.forward_10, color: Colors.white), onPressed: _skipForward),
-            const SizedBox(width: 16),
-            IconButton(icon: const Icon(Icons.settings, color: Colors.white), onPressed: _openSettingsSheet),
-            const SizedBox(width: 12),
-            IconButton(icon: Icon(_isFullscreen ? Icons.fullscreen_exit : Icons.fullscreen, color: Colors.white), onPressed: _toggleFullscreen),
-          ]),
-        ]),
-      ),
-    );
   }
 
   void _openSettingsSheet() {
@@ -364,7 +525,7 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
                 if (_audioTracks.isEmpty) const ListTile(title: Text('No audio tracks found'))
                 else ..._audioTracks.entries.map((e) {
                   final id = e.key;
-                  final label = e.value.isNotEmpty ? e.value : 'Audio $id';
+                  final label = (e.value ?? '').isNotEmpty ? e.value : 'Audio $id';
                   return RadioListTile<int>(title: Text(label), value: id, groupValue: _selectedAudioId, onChanged: (val) async {
                     if (val != null) {
                       await _changeAudioTrack(val);
@@ -381,7 +542,7 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
                 if (_subtitleTracks.isEmpty) const ListTile(title: Text('No subtitles found'))
                 else ..._subtitleTracks.entries.map((e) {
                   final id = e.key;
-                  final label = e.value.isNotEmpty ? e.value : 'Subtitle $id';
+                  final label = (e.value ?? '').isNotEmpty ? e.value : 'Subtitle $id';
                   return RadioListTile<int>(title: Text(label), value: id, groupValue: _selectedSubtitleId ?? -2, onChanged: (val) async {
                     if (val != null) {
                       await _changeSubtitleTrack(val);
@@ -400,8 +561,8 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
 
   @override
   void dispose() {
-    _positionTimer?.cancel();
     _hideTimer?.cancel();
+    _detachControllerListener();
     try {
       _vlcController?.dispose();
     } catch (_) {}
@@ -410,43 +571,99 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
     super.dispose();
   }
 
+  String _formatMs(double ms) {
+    final totalSeconds = (ms / 1000).floor();
+    final hours = totalSeconds ~/ 3600;
+    final minutes = (totalSeconds % 3600) ~/ 60;
+    final seconds = totalSeconds % 60;
+    if (hours > 0) {
+      return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+    } else {
+      return '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}';
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_loading) return const Center(child: CircularProgressIndicator());
-    if (_vlcController == null) return const Center(child: Text('Player not initialized', style: TextStyle(color: Colors.white)));
 
     final mq = MediaQuery.of(context);
     final screenWidth = mq.size.width;
     final screenHeight = mq.size.height;
 
-    // Compute width & height that best fit the screen according to video aspect:
-    double width = screenWidth;
-    double height = width / _videoAspect;
+    // compute display size (portrait videos should take most height)
+    double displayWidth;
+    double displayHeight;
 
-    if (height > screenHeight) {
-      height = screenHeight;
-      width = height * _videoAspect;
+    if (_isFullscreen) {
+      displayWidth = screenWidth;
+      displayHeight = screenHeight;
+    } else {
+      if (_videoAspect < 1.0) {
+        displayHeight = min(screenHeight * 0.95, screenHeight);
+        displayWidth = displayHeight * _videoAspect;
+        if (displayWidth > screenWidth) {
+          displayWidth = screenWidth;
+          displayHeight = displayWidth / _videoAspect;
+        }
+      } else {
+        displayWidth = screenWidth;
+        displayHeight = displayWidth / _videoAspect;
+        if (displayHeight > screenHeight) {
+          displayHeight = screenHeight;
+          displayWidth = displayHeight * _videoAspect;
+        }
+      }
     }
 
-    // If NOT fullscreen, clamp height so very tall portrait videos don't take the entire screen
-    final maxNonFsHeight = (screenHeight * 0.78).clamp(200.0, screenHeight);
-    final displayHeight = _isFullscreen ? (height) : height.clamp(200.0, maxNonFsHeight);
-    final displayWidth = _isFullscreen ? (width) : width;
-
-    // When fullscreen, align video to top so controls sit at the bottom of the screen
     final alignment = _isFullscreen ? Alignment.topCenter : Alignment.center;
+
+    // If there was an init error, show overlay with retry
+    final errorOverlay = _initError != null
+        ? Positioned.fill(
+      child: Container(
+        color: Colors.black87,
+        child: Center(
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            Text(_initError!, style: const TextStyle(color: Colors.white)),
+            const SizedBox(height: 12),
+            ElevatedButton(
+              onPressed: () {
+                _recreateController();
+              },
+              child: const Text('Retry'),
+            ),
+            const SizedBox(height: 8),
+            Text('Path: ${widget.videoPath}', style: const TextStyle(color: Colors.white70, fontSize: 12)),
+          ]),
+        ),
+      ),
+    )
+        : const SizedBox.shrink();
 
     return Container(
       color: Colors.black,
       child: Stack(
         children: [
-          // video area - virtualDisplay so overlays get taps
           Align(
             alignment: alignment,
-            child: SizedBox(
+            child: _isFullscreen
+                ? SizedBox.expand(
+              child: _vlcController == null
+                  ? const Center(child: CircularProgressIndicator())
+                  : VlcPlayer(
+                controller: _vlcController!,
+                aspectRatio: _videoAspect,
+                placeholder: const Center(child: CircularProgressIndicator()),
+                virtualDisplay: true,
+              ),
+            )
+                : SizedBox(
               width: displayWidth,
-              height: _isFullscreen ? screenHeight : displayHeight,
-              child: VlcPlayer(
+              height: displayHeight,
+              child: _vlcController == null
+                  ? const Center(child: CircularProgressIndicator())
+                  : VlcPlayer(
                 controller: _vlcController!,
                 aspectRatio: _videoAspect,
                 placeholder: const Center(child: CircularProgressIndicator()),
@@ -455,7 +672,7 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
             ),
           ),
 
-          // Controls overlay (cover full screen) — taps will toggle
+          // Controls overlay at bottom (still present)
           GestureDetector(
             behavior: HitTestBehavior.opaque,
             onTap: () {
@@ -464,13 +681,41 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
             },
             child: AnimatedOpacity(
               duration: const Duration(milliseconds: 180),
-              opacity: _showControls ? 1.0 : 0.0,
+              opacity: _showControls && _initError == null ? 1.0 : 0.0,
               child: Align(
                 alignment: Alignment.bottomCenter,
-                child: _buildControlBar(fullscreen: _isFullscreen),
+                child: VLCControls(
+                  currentPosition: _currentPosition,
+                  duration: _duration,
+                  isPlaying: _isPlaying,
+                  isFullscreen: _isFullscreen,
+                  playbackSpeed: _playbackSpeed,
+                  audioTracks: _audioTracks,
+                  subtitleTracks: _subtitleTracks,
+                  selectedAudioId: _selectedAudioId,
+                  selectedSubtitleId: _selectedSubtitleId,
+                  onSeekChanged: (v) {
+                    setState(() => _currentPosition = v);
+                  },
+                  onSeekEnd: (v) async {
+                    await _seekTo(v);
+                    _startHideTimer();
+                  },
+                  onSeekStart: () {
+                    _hideTimer?.cancel();
+                  },
+                  onPlayPause: _onPlayPausePressed,
+                  onSkipForward: _skipForward,
+                  onSkipBackward: _skipBackward,
+                  onToggleFullscreen: _toggleFullscreen,
+                  onOpenSettings: _openSettingsSheet,
+                ),
               ),
             ),
           ),
+
+          // error overlay (if present)
+          errorOverlay,
         ],
       ),
     );
