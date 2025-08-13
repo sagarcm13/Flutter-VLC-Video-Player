@@ -1,4 +1,3 @@
-// lib/ui/players/vlc_controls.dart
 import 'package:flutter/material.dart';
 
 class VLCControls extends StatelessWidget {
@@ -70,9 +69,9 @@ class VLCControls extends StatelessWidget {
             const SizedBox(width: 8),
             Expanded(
               child: Slider(
-                min: 0,
+                min: 0.0,
                 max: duration > 0 ? duration : 1.0,
-                value: currentPosition.clamp(0, duration),
+                value: currentPosition.clamp(0.0, duration),
                 onChangeStart: (_) => onSeekStart(),
                 onChanged: (v) => onSeekChanged(v),
                 onChangeEnd: (v) => onSeekEnd(v),
