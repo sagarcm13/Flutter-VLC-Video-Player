@@ -35,6 +35,7 @@ dependencies:
   flutter_vlc_player: ^7.4.1
   file_picker: ^8.0.0
   list_all_videos: ^1.3.3
+  wakelock_plus: ^1.2.2
 
 dev_dependencies:
   flutter_test:

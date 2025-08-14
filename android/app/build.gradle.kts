@@ -21,9 +21,7 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        ndk {
-            abiFilters += listOf("armeabi-v7a","arm64-v8a","x86","x86_64")
-        }
+
         applicationId = "com.example.video_player"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.

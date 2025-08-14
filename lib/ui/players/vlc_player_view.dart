@@ -1,9 +1,9 @@
 // lib/ui/players/vlc_player_view.dart
 import 'dart:async';
 import 'dart:io';
-import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_vlc_player/flutter_vlc_player.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'vlc_controls.dart';
 
 class VLCPlayerView extends StatefulWidget {
@@ -88,15 +88,15 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
     }
 
     if (!mounted) return;
+
+    final effectivePlaying = !ignoreActive && playing;
+    final effectiveEnded = ignoreActive ? false : endedFlag;
+
     setState(() {
       _currentPosition = posMs;
       if (durMs > 0) _duration = durMs;
 
-      if (!ignoreActive) {
-        _isPlaying = playing;
-      }
-
-      final effectiveEnded = ignoreActive ? false : endedFlag;
+      _isPlaying = effectivePlaying;
 
       if (effectiveEnded) {
         _isEnded = true;
@@ -111,6 +111,18 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
         _ignorePlayingUntil = null;
       }
     });
+
+    // Manage wakelock: keep screen on only while actively playing
+    try {
+      if (effectivePlaying) {
+        WakelockPlus.enable();
+      } else {
+        // if paused/stopped/ended -> allow screen to sleep
+        WakelockPlus.disable();
+      }
+    } catch (e) {
+      debugPrint('wakelock error: $e');
+    }
   }
 
   @override
@@ -264,7 +276,8 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
   Future<void> _seekTo(double millis) async {
     final c = _vlcController;
     if (c == null) return;
-    final ms = millis.clamp(0.0, _duration).toInt();
+    final maxMs = _duration > 0 ? _duration : millis;
+    final ms = millis.clamp(0.0, maxMs).toInt();
     try {
       await c.seekTo(Duration(milliseconds: ms));
       if (mounted) {
@@ -413,12 +426,14 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
         if (!success) {
           setState(() => _initError = 'Unable to restart playback (see logs).');
         } else {
-          if (mounted) setState(() {
-            _currentPosition = 0.0;
-            _isPlaying = true;
-            _isEnded = false;
-            _initError = null;
-          });
+          if (mounted) {
+            setState(() {
+              _currentPosition = 0.0;
+              _isPlaying = true;
+              _isEnded = false;
+              _initError = null;
+            });
+          }
         }
       } else {
         if (playing) {
@@ -444,6 +459,10 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
     _detachControllerListener();
     try {
       _vlcController?.dispose();
+    } catch (_) {}
+    // Always disable wakelock when leaving the player
+    try {
+      WakelockPlus.disable();
     } catch (_) {}
     super.dispose();
   }
@@ -552,11 +571,22 @@ class _VLCPlayerViewState extends State<VLCPlayerView> {
           children: [
             Align(alignment: widget.isFullscreen ? Alignment.topCenter : Alignment.center, child: playerWidget),
 
+            // Gesture detector to toggle controls + double-tap to skip
             GestureDetector(
               behavior: HitTestBehavior.opaque,
               onTap: () {
                 setState(() => _showControls = !_showControls);
                 if (_showControls) _startHideTimer();
+              },
+              onDoubleTapDown: (details) {
+                final width = MediaQuery.of(context).size.width;
+                // left half -> back, right half -> forward
+                if (details.globalPosition.dx < width / 2) {
+                  _skipBackward();
+                } else {
+                  _skipForward();
+                }
+                _startHideTimer();
               },
               child: AnimatedOpacity(
                 duration: const Duration(milliseconds: 180),
